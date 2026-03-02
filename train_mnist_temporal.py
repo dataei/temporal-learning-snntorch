@@ -1,3 +1,9 @@
+##############################################
+#comparing accuracy vs mean_ttd vs mean_spikes
+#comment out this entire block when doing step 1
+#to obtain MNIST dataset and run epochs 1-3
+import argparse
+##############################################
 import math
 import torch
 import torch.nn as nn
@@ -131,8 +137,17 @@ def main(
     T_on=5,
     T_off=None
 ):
+    # ###############################
+    # #comment out for step 3
+    # if T_off is None:
+    #     T_off = num_steps - 1
+    # ###############################
+
+    ############################################
+    #uncomment only for step 3
     if T_off is None:
-        T_off = num_steps - 1
+        T_off = min(num_steps - 1, T_on + 10)
+    ############################################
 
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -187,5 +202,21 @@ def main(
 
         print(f"[test] acc={correct/total:.4f}  mean_ttd={ttd_sum/total:.2f}  mean_spikes={spike_sum/total:.1f}")
 
+# #################################
+# #comment out this block when done 
+# #with step 1
+# if __name__ == "__main__":
+#     main()
+# #################################
+
+########################################################################
+#uncomment when doing step 2 and 3 to compare accuracy vs mean_ttd vs mean_spikes
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument("--steps", type=int, default=25)
+    p.add_argument("--Ton", type=int, default=5)
+    p.add_argument("--epochs", type=int, default=3)
+    args = p.parse_args()
+
+    main(num_steps=args.steps, T_on=args.Ton, epochs=args.epochs)
+########################################################################
