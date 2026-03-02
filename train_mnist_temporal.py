@@ -201,6 +201,7 @@ def main(
                 spike_sum += spike_proxy.item() * x.shape[0]
 
         print(f"[test] acc={correct/total:.4f}  mean_ttd={ttd_sum/total:.2f}  mean_spikes={spike_sum/total:.1f}")
+        print(f"SUMMARY Ton={T_on} steps={num_steps}  acc={correct/total:.4f}  ttd={ttd_sum/total:.2f}  spikes={spike_sum/total:.1f}")
 
 # #################################
 # #comment out this block when done 
