@@ -135,7 +135,7 @@ def main(
     lr=1e-3,
     beta=0.95,
     T_on=5,
-    T_off=None
+    T_off=None, lam=0.0
 ):
     # ###############################
     # #comment out for step 3
@@ -175,6 +175,7 @@ def main(
             spk_out, mem_out, spike_proxy = net(spk_in)
 
             loss = loss_fn(spk_out, y)
+            loss = loss + lam * (spk_out.sum() / x.shape[0])
 
             opt.zero_grad()
             loss.backward()
@@ -217,7 +218,8 @@ if __name__ == "__main__":
     p.add_argument("--steps", type=int, default=25)
     p.add_argument("--Ton", type=int, default=5)
     p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--lam", type=float, default=0.0)
     args = p.parse_args()
 
-    main(num_steps=args.steps, T_on=args.Ton, epochs=args.epochs)
+    main(num_steps=args.steps, T_on=args.Ton, epochs=args.epochs, lam=args.lam)
 ########################################################################
