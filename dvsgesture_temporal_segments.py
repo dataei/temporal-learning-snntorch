@@ -1,14 +1,18 @@
-# dvsgesture_temporal.py
-# DVSGesture experiments (MNIST-style): --Ton, --steps, --lam, SUMMARY
+# dvsgesture_temporal_segments.py
+# DVSGesture (IBM) segment-based temporal-learning experiments (MNIST-style):
+#   --Ton, --steps, --lam, SUMMARY
+#
+# Uses:
+#   trials_to_train.txt / trials_to_test.txt  (recording list)
+#   corresponding *_labels.csv                (segments with class + time range)
 #
 # Requirements:
 #   pip install torch snntorch tonic tqdm numpy
 #
-# Run:
-#   python dvsgesture_temporal.py --epochs 1 --steps 20 --Ton 6 --batch 2 --workers 0 --root ./data/DVSGesture
+# Run (smoke test):
+#   python dvsgesture_temporal_segments.py --epochs 1 --steps 20 --Ton 6 --batch 2 --workers 0 --root ./data/DVSGesture
 
 import argparse
-import re
 from pathlib import Path
 
 import numpy as np
@@ -26,14 +30,13 @@ import tonic.io as tio
 
 
 # ----------------------------
-# Robust DVS128 .aedat reader (no read_dvs_ibm)
+# Robust DVS128 .aedat reader (no tonic.read_dvs_ibm)
 # ----------------------------
 _EVENTS_DTYPE = np.dtype([("x", np.int16), ("y", np.int16), ("t", np.int64), ("p", np.int8)])
 
 def read_events_dvs128_aedat(filename: str) -> np.ndarray:
     """
-    Reads address-event data using tonic's low-level helpers and decodes address into x,y,p.
-    Handles tonic versions where read_aedat_header_from_file returns 2 or 3 values.
+    Reads .aedat using tonic low-level helpers and decodes address into x,y,p.
     DVS128 address layout (common):
       bit 0    : polarity
       bits 1-7 : x
@@ -65,102 +68,158 @@ def read_events_dvs128_aedat(filename: str) -> np.ndarray:
     return events
 
 
-def infer_label_from_name(aedat_path: str) -> int:
+def load_labels_csv(csv_path: Path):
     """
-    Infer class from 'gesture<number>' in path. Maps 1..11 -> 0..10.
+    Expects columns:
+      class,startTime_usec,endTime_usec
+    Returns list of (label0_10, t_start, t_end)
     """
-    s = Path(aedat_path).as_posix().lower()
-    m = re.search(r"gesture(\d+)", s)
-    if m:
-        g = int(m.group(1))
-        return max(0, min(10, g - 1))
-    return 0
+    rows = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        header = f.readline().strip()
+        if header != "class,startTime_usec,endTime_usec":
+            raise RuntimeError(f"Unexpected label CSV header in {csv_path}: {header}")
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            c, ts, te = line.split(",")
+            c = int(c)              # 1..11
+            y = max(0, min(10, c-1))  # -> 0..10
+            t0 = int(ts)
+            t1 = int(te)
+            if t1 > t0:
+                rows.append((y, t0, t1))
+    return rows
 
 
 # ----------------------------
-# Dataset
+# Segment dataset
 # ----------------------------
-class DVSGestureRaw(Dataset):
-    def __init__(self, root: str, train: bool, transform=None, H=64, W=64, strict_labels=False):
+class DVSGestureSegments(Dataset):
+    """
+    Each item is a labeled segment from a recording.
+    """
+    def __init__(self, root: str, train: bool, H: int, W: int, steps: int, cache_files: int = 2):
         self.root = Path(root)
-        self.transform = transform
         self.H = H
         self.W = W
-        self.strict_labels = strict_labels
+        self.steps = steps
+
+        if 128 % H != 0 or 128 % W != 0:
+            raise ValueError("H and W must divide 128 evenly (e.g., 64 or 32).")
 
         split_file = self.root / ("trials_to_train.txt" if train else "trials_to_test.txt")
         if not split_file.exists():
-            raise FileNotFoundError(f"Missing {split_file}. root should be ./data/DVSGesture")
+            raise FileNotFoundError(f"Missing {split_file}")
 
         with open(split_file, "r", encoding="utf-8") as f:
-            trial_names = [ln.strip() for ln in f.readlines() if ln.strip()]
+            rec_names = [ln.strip() for ln in f.readlines() if ln.strip()]
 
-        aedat_files = list(self.root.rglob("*.aedat"))
-        if len(aedat_files) == 0:
-            raise RuntimeError(f"No .aedat files found under {self.root}")
-
-        aedat_map = {p.stem: p for p in aedat_files}
-
-        self.samples = []
-        self.labels = []
+        # Build list of segments: (aedat_path, y, t0, t1)
+        self.segments = []
         missing = []
+        for rec in rec_names:
+            aedat_path = self.root / rec
+            labels_path = self.root / rec.replace(".aedat", "_labels.csv")
+            if not aedat_path.exists():
+                missing.append(str(aedat_path))
+                continue
+            if not labels_path.exists():
+                missing.append(str(labels_path))
+                continue
 
-        for name in trial_names:
-            stem = Path(name).stem
-            p = aedat_map.get(stem, None)
-            if p is None:
-                # fallback contains match
-                matches = [pp for k, pp in aedat_map.items() if k.endswith(stem) or stem.endswith(k)]
-                if matches:
-                    p = matches[0]
-                else:
-                    missing.append(stem)
-                    continue
-
-            y = infer_label_from_name(str(p))
-            if strict_labels and y == 0:
-                raise RuntimeError(
-                    f"Could not infer label from filename: {p}\n"
-                    f"Your filenames may not contain gesture<number>."
-                )
-
-            self.samples.append(p)
-            self.labels.append(y)
-
-        if len(self.samples) == 0:
-            raise RuntimeError("Resolved 0 samples. Check your split files vs .aedat filenames.")
+            segs = load_labels_csv(labels_path)
+            for (y, t0, t1) in segs:
+                self.segments.append((aedat_path, y, t0, t1))
 
         if missing:
-            print(f"[warn] missing {len(missing)} trials (showing 5): {missing[:5]}")
+            print("[warn] missing files (showing up to 5):")
+            for m in missing[:5]:
+                print("  ", m)
+
+        if len(self.segments) == 0:
+            raise RuntimeError("No segments found. Check that *_labels.csv files exist and are non-empty.")
+
+        # Event -> frame transform (no Downsample here; we downsample coords ourselves)
+        self.to_frame = TT.Compose([
+            TT.Denoise(filter_time=10000),
+            TT.ToFrame(sensor_size=(H, W, 2), n_time_bins=steps),
+        ])
+
+        # small LRU-ish cache for decoded full recordings
+        self._cache_files = cache_files
+        self._cache = {}      # path -> events
+        self._cache_order = []  # paths in recency order
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.segments)
+
+    def _get_events_cached(self, aedat_path: Path) -> np.ndarray:
+        key = str(aedat_path)
+        if key in self._cache:
+            # refresh recency
+            if key in self._cache_order:
+                self._cache_order.remove(key)
+            self._cache_order.append(key)
+            return self._cache[key]
+
+        ev = read_events_dvs128_aedat(key)
+
+        self._cache[key] = ev
+        self._cache_order.append(key)
+        # evict old
+        while len(self._cache_order) > self._cache_files:
+            old = self._cache_order.pop(0)
+            self._cache.pop(old, None)
+        return ev
 
     def __getitem__(self, idx):
-        aedat_path = str(self.samples[idx])
-        y = int(self.labels[idx])
+        aedat_path, y, t0, t1 = self.segments[idx]
+        ev_full = self._get_events_cached(aedat_path)
 
-        events = read_events_dvs128_aedat(aedat_path)
+        # slice time window
+        m = (ev_full["t"] >= t0) & (ev_full["t"] < t1)
+        ev = ev_full[m]
+        if ev.size == 0:
+            # return an empty-ish segment as zeros
+            frames = np.zeros((self.steps, self.H, self.W, 2), dtype=np.uint8)
+            return frames, y
 
-        # Manual downsample of coordinates BEFORE ToFrame to prevent out-of-bounds
+        # shift time to start at 0 for this segment
+        ev = ev.copy()
+        ev["t"] = (ev["t"] - t0).astype(np.int64)
+
+        # downsample coords to HxW
         fx = 128 // self.W
         fy = 128 // self.H
-        if fx <= 0 or fy <= 0 or (128 % self.W != 0) or (128 % self.H != 0):
-            raise ValueError("H and W must divide 128 evenly (e.g., 64, 32).")
+        ev["x"] = (ev["x"] // fx).astype(np.int16)
+        ev["y"] = (ev["y"] // fy).astype(np.int16)
+        ev["x"] = np.clip(ev["x"], 0, self.W - 1)
+        ev["y"] = np.clip(ev["y"], 0, self.H - 1)
 
-        events["x"] = (events["x"] // fx).astype(np.int16)
-        events["y"] = (events["y"] // fy).astype(np.int16)
-
-        # Clip just in case
-        events["x"] = np.clip(events["x"], 0, self.W - 1)
-        events["y"] = np.clip(events["y"], 0, self.H - 1)
-
-        if self.transform is not None:
-            frames = self.transform(events)
-        else:
-            frames = events
-
+        frames = self.to_frame(ev)  # [T,H,W,2] or [T,2,H,W] depending on tonic version
         return frames, y
+
+
+def collate_frames(batch):
+    xs, ys = zip(*batch)
+    xs = torch.stack([torch.as_tensor(x) for x in xs])  # [B, ...]
+    ys = torch.tensor(ys, dtype=torch.long)
+
+    if xs.ndim != 5:
+        raise RuntimeError(f"Unexpected frame tensor shape: {xs.shape}")
+
+    # [B,T,H,W,2] -> [B,T,2,H,W]
+    if xs.shape[-1] == 2:
+        xs = xs.permute(0, 1, 4, 2, 3)
+    elif xs.shape[2] == 2:
+        pass
+    else:
+        raise RuntimeError(f"Unexpected channel layout: {xs.shape}")
+
+    xs = (xs > 0).float()
+    return xs, ys
 
 
 # ----------------------------
@@ -215,15 +274,12 @@ class ConvTemporalSNN(nn.Module):
             spk_out_rec.append(spk_out)
             mem_out_rec.append(mem_out)
 
-        spk_out_rec = torch.stack(spk_out_rec)
-        mem_out_rec = torch.stack(mem_out_rec)
+        spk_out_rec = torch.stack(spk_out_rec)  # [T,B,C]
+        mem_out_rec = torch.stack(mem_out_rec)  # [T,B,C]
         spike_proxy = spike_count / B
         return spk_out_rec, mem_out_rec, spike_proxy
 
 
-# ----------------------------
-# Temporal decoding
-# ----------------------------
 def first_spike_time(spk_out):
     T, B, C = spk_out.shape
     fst = torch.full((B, C), T, device=spk_out.device, dtype=torch.long)
@@ -239,27 +295,8 @@ def predict_by_earliest_first_spike(spk_out):
     return pred, ttd
 
 
-def collate_frames(batch):
-    xs, ys = zip(*batch)
-    xs = torch.stack([torch.as_tensor(x) for x in xs])
-    ys = torch.tensor(ys, dtype=torch.long)
-
-    if xs.ndim != 5:
-        raise RuntimeError(f"Unexpected frame tensor shape: {xs.shape}")
-
-    if xs.shape[-1] == 2:
-        xs = xs.permute(0, 1, 4, 2, 3)  # [B,T,H,W,2] -> [B,T,2,H,W]
-    elif xs.shape[2] == 2:
-        pass
-    else:
-        raise RuntimeError(f"Unexpected channel layout: {xs.shape}")
-
-    xs = (xs > 0).float()
-    return xs, ys
-
-
 # ----------------------------
-# Train/Test
+# Train / Test
 # ----------------------------
 def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -267,18 +304,12 @@ def main(args):
     T_off = min(args.steps - 1, args.Ton + 10)
     loss_fn = SF.mse_temporal_loss(on_target=args.Ton, off_target=T_off)
 
-    # IMPORTANT: no TT.Downsample here — we already downsampled events in __getitem__
-    transform = TT.Compose([
-        TT.Denoise(filter_time=10000),
-        TT.ToFrame(sensor_size=(args.H, args.W, 2), n_time_bins=args.steps),
-    ])
+    train_ds = DVSGestureSegments(args.root, train=True, H=args.H, W=args.W, steps=args.steps, cache_files=args.cache_files)
+    test_ds  = DVSGestureSegments(args.root, train=False, H=args.H, W=args.W, steps=args.steps, cache_files=args.cache_files)
 
-    ds_train = DVSGestureRaw(args.root, train=True, transform=transform, H=args.H, W=args.W, strict_labels=args.strict_labels)
-    ds_test  = DVSGestureRaw(args.root, train=False, transform=transform, H=args.H, W=args.W, strict_labels=args.strict_labels)
-
-    dl_train = DataLoader(ds_train, batch_size=args.batch, shuffle=True,
+    train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
                           num_workers=args.workers, pin_memory=False, collate_fn=collate_frames)
-    dl_test  = DataLoader(ds_test, batch_size=args.batch, shuffle=False,
+    test_dl  = DataLoader(test_ds, batch_size=args.batch, shuffle=False,
                           num_workers=args.workers, pin_memory=False, collate_fn=collate_frames)
 
     net = ConvTemporalSNN(num_classes=11, beta=args.beta).to(device)
@@ -286,7 +317,7 @@ def main(args):
 
     for ep in range(1, args.epochs + 1):
         net.train()
-        pbar = tqdm(dl_train, desc=f"epoch {ep}/{args.epochs}")
+        pbar = tqdm(train_dl, desc=f"epoch {ep}/{args.epochs}")
 
         for x, y in pbar:
             x = x.to(device)  # [B,T,2,H,W]
@@ -315,7 +346,7 @@ def main(args):
         correct, total = 0, 0
         ttd_sum, spike_sum = 0.0, 0.0
         with torch.no_grad():
-            for x, y in dl_test:
+            for x, y in test_dl:
                 x = x.to(device)
                 y = y.to(device)
                 spk_in = x.permute(1, 0, 2, 3, 4)
@@ -333,7 +364,7 @@ def main(args):
         mean_spikes = spike_sum / total
 
         print(f"[test] acc={acc_test:.4f}  mean_ttd={mean_ttd:.2f}  mean_spikes={mean_spikes:.1f}")
-        print(f"SUMMARY dataset=DVSGestureRaw Ton={args.Ton} steps={args.steps} H={args.H} W={args.W} lam={args.lam}  "
+        print(f"SUMMARY dataset=DVSGestureSegments Ton={args.Ton} steps={args.steps} H={args.H} W={args.W} lam={args.lam}  "
               f"acc={acc_test:.4f}  ttd={mean_ttd:.2f}  spikes={mean_spikes:.1f}")
 
 
@@ -349,8 +380,8 @@ if __name__ == "__main__":
     p.add_argument("--beta", type=float, default=0.95)
     p.add_argument("--Ton", type=int, default=6)
     p.add_argument("--lam", type=float, default=0.0)
-    p.add_argument("--workers", type=int, default=0)
-    p.add_argument("--strict_labels", action="store_true")
+    p.add_argument("--workers", type=int, default=0)      # keep 0 until stable
+    p.add_argument("--cache_files", type=int, default=2)  # helps speed a lot
     args = p.parse_args()
 
     main(args)
