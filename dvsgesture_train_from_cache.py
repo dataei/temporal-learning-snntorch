@@ -1,28 +1,11 @@
 # dvsgesture_train_from_cache.py
-# Train DVSGesture experiments from precomputed frame cache (FAST).
-#
-# Cache format: each file is .npz with:
-#   frames: uint8 array shape [T,H,W,2]  (event counts per bin, polarity channel last)
-#   label : int (0..10)
-#
-# Requirements:
-#   pip install torch snntorch tqdm numpy
-#
-# Example:
-#   python dvsgesture_train_from_cache.py \
-#     --train_cache ./data/DVSGesture/cache_T10_H32_W32_train \
-#     --test_cache  ./data/DVSGesture/cache_T10_H32_W32_test  \
-#     --epochs 3 --steps 10 --Ton 3 --H 32 --W 32 --batch 64 --workers 2
-#
-# Then do sweeps like MNIST:
-#   --Ton 3/6/10 and --lam 0 vs 3e-6
-
 import argparse
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
@@ -31,15 +14,11 @@ from snntorch import surrogate
 from snntorch import functional as SF
 
 
-# ----------------------------
-# Dataset: cached .npz frames
-# ----------------------------
 class CachedFrames(Dataset):
     def __init__(self, cache_dir: str):
         self.cache_dir = Path(cache_dir)
         if not self.cache_dir.exists():
             raise FileNotFoundError(f"Cache dir not found: {self.cache_dir}")
-
         self.files = sorted(self.cache_dir.glob("*.npz"))
         if len(self.files) == 0:
             raise RuntimeError(f"No .npz files found in {self.cache_dir}")
@@ -63,17 +42,14 @@ def collate_cached(batch):
     if xs.ndim != 5 or xs.shape[-1] != 2:
         raise RuntimeError(f"Unexpected cached frame shape: {xs.shape} (expected [B,T,H,W,2])")
 
-    # [B,T,H,W,2] -> [B,T,2,H,W]
-    xs = xs.permute(0, 1, 4, 2, 3)
-
-    # binarize to spikes
-    xs = (xs > 0).float()
+    xs = xs.permute(0, 1, 4, 2, 3)  # [B,T,2,H,W]
+    xs = xs.float()
+    # normalize per-sample to keep values in a stable range
+    mx = xs.amax(dim=(1,2,3,4), keepdim=True).clamp(min=1.0)
+    xs = xs / mx
     return xs, ys
 
 
-# ----------------------------
-# Model (same as before)
-# ----------------------------
 class ConvTemporalSNN(nn.Module):
     def __init__(self, num_classes=11, beta=0.95):
         super().__init__()
@@ -125,7 +101,7 @@ class ConvTemporalSNN(nn.Module):
             mem_out_rec.append(mem_out)
 
         spk_out_rec = torch.stack(spk_out_rec)  # [T,B,C]
-        mem_out_rec = torch.stack(mem_out_rec)
+        mem_out_rec = torch.stack(mem_out_rec)  # [T,B,C]
         spike_proxy = spike_count / B
         return spk_out_rec, mem_out_rec, spike_proxy
 
@@ -138,6 +114,7 @@ def first_spike_time(spk_out):
         fst = torch.where((fst == T) & fired, torch.tensor(t, device=spk_out.device), fst)
     return fst
 
+
 def predict_by_earliest_first_spike(spk_out):
     fst = first_spike_time(spk_out)
     pred = torch.argmin(fst, dim=1)
@@ -145,43 +122,52 @@ def predict_by_earliest_first_spike(spk_out):
     return pred, ttd
 
 
-# ----------------------------
-# Train / Test
-# ----------------------------
 def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     train_ds = CachedFrames(args.train_cache)
     test_ds = CachedFrames(args.test_cache)
 
-    train_dl = DataLoader(
-        train_ds, batch_size=args.batch, shuffle=True,
-        num_workers=args.workers, pin_memory=False, collate_fn=collate_cached
-    )
-    test_dl = DataLoader(
-        test_ds, batch_size=args.batch, shuffle=False,
-        num_workers=args.workers, pin_memory=False, collate_fn=collate_cached
-    )
+    train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
+                          num_workers=args.workers, pin_memory=False, collate_fn=collate_cached)
+    test_dl = DataLoader(test_ds, batch_size=args.batch, shuffle=False,
+                         num_workers=args.workers, pin_memory=False, collate_fn=collate_cached)
 
     net = ConvTemporalSNN(num_classes=11, beta=args.beta).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
 
-    # Tight off-target window
+    # temporal loss (only used in temporal mode)
     T_off = min(args.steps - 1, args.Ton + 10)
-    loss_fn = SF.mse_temporal_loss(on_target=args.Ton, off_target=T_off)
+    temporal_loss = SF.mse_temporal_loss(on_target=args.Ton, off_target=T_off)
 
     for ep in range(1, args.epochs + 1):
         net.train()
         pbar = tqdm(train_dl, desc=f"epoch {ep}/{args.epochs}")
         for x, y in pbar:
-            # x: [B,T,2,H,W] -> [T,B,2,H,W]
-            x = x.to(device)
+            x = x.to(device)  # [B,T,2,H,W]
             y = y.to(device)
 
-            spk_in = x.permute(1, 0, 2, 3, 4)
+            spk_in = x.permute(1, 0, 2, 3, 4)  # [T,B,2,H,W]
             spk_out, mem_out, spike_proxy = net(spk_in)
 
-            loss = loss_fn(spk_out, y)
+            # ---- define logits/loss per mode (ALWAYS sets loss) ----
+            if args.mode == "temporal":
+                loss = temporal_loss(spk_out, y)
+                pred, ttd = predict_by_earliest_first_spike(spk_out.detach())
+            elif args.mode == "rate_mem":
+                logits = mem_out[-1]                 # [B,C]
+                loss = F.cross_entropy(logits, y)
+                pred = logits.argmax(1)
+                ttd = torch.full((y.shape[0],), args.steps, device=device, dtype=torch.long)
+            elif args.mode == "rate_spk":
+                logits = spk_out.sum(0)              # [B,C]
+                loss = F.cross_entropy(logits, y)
+                pred = logits.argmax(1)
+                ttd = torch.full((y.shape[0],), args.steps, device=device, dtype=torch.long)
+            else:
+                raise ValueError(f"Unknown mode: {args.mode}")
+
+            # optional spike penalty
             if args.lam != 0.0:
                 loss = loss + args.lam * (spk_out.sum() / x.shape[0])
 
@@ -189,25 +175,34 @@ def main(args):
             loss.backward()
             opt.step()
 
-            pred, ttd = predict_by_earliest_first_spike(spk_out.detach())
             acc = (pred == y).float().mean().item()
             pbar.set_postfix(loss=float(loss.item()),
                              acc=float(acc),
                              ttd=float(ttd.float().mean().item()),
                              spikes=float(spike_proxy.item()))
 
-        # eval
+        # ---- eval ----
         net.eval()
         correct, total = 0, 0
         ttd_sum, spike_sum = 0.0, 0.0
+
         with torch.no_grad():
             for x, y in test_dl:
                 x = x.to(device)
                 y = y.to(device)
                 spk_in = x.permute(1, 0, 2, 3, 4)
-
                 spk_out, mem_out, spike_proxy = net(spk_in)
-                pred, ttd = predict_by_earliest_first_spike(spk_out)
+
+                if args.mode == "temporal":
+                    pred, ttd = predict_by_earliest_first_spike(spk_out)
+                elif args.mode == "rate_mem":
+                    logits = mem_out[-1]
+                    pred = logits.argmax(1)
+                    ttd = torch.full((y.shape[0],), args.steps, device=device, dtype=torch.long)
+                else:  # rate_spk
+                    logits = spk_out.sum(0)
+                    pred = logits.argmax(1)
+                    ttd = torch.full((y.shape[0],), args.steps, device=device, dtype=torch.long)
 
                 correct += (pred == y).sum().item()
                 total += y.numel()
@@ -219,7 +214,7 @@ def main(args):
         mean_spikes = spike_sum / total
 
         print(f"[test] acc={acc_test:.4f}  mean_ttd={mean_ttd:.2f}  mean_spikes={mean_spikes:.1f}")
-        print(f"SUMMARY dataset=DVSGestureCached Ton={args.Ton} steps={args.steps} H={args.H} W={args.W} lam={args.lam}  "
+        print(f"SUMMARY mode={args.mode} dataset=DVSGestureCached Ton={args.Ton} steps={args.steps} H={args.H} W={args.W} lam={args.lam}  "
               f"acc={acc_test:.4f}  ttd={mean_ttd:.2f}  spikes={mean_spikes:.1f}")
 
 
@@ -227,15 +222,16 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--train_cache", type=str, required=True)
     p.add_argument("--test_cache", type=str, required=True)
-    p.add_argument("--steps", type=int, default=10)
+    p.add_argument("--steps", type=int, default=25)
     p.add_argument("--H", type=int, default=32)
     p.add_argument("--W", type=int, default=32)
     p.add_argument("--batch", type=int, default=64)
-    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--beta", type=float, default=0.95)
-    p.add_argument("--Ton", type=int, default=3)
+    p.add_argument("--Ton", type=int, default=6)
     p.add_argument("--lam", type=float, default=0.0)
     p.add_argument("--workers", type=int, default=2)
+    p.add_argument("--mode", type=str, default="temporal", choices=["temporal", "rate_mem", "rate_spk"])
     args = p.parse_args()
     main(args)
