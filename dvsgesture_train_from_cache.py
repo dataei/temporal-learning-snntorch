@@ -36,35 +36,50 @@ class CachedFrames(Dataset):
 
 def collate_cached(batch):
     xs, ys = zip(*batch)
-    xs = torch.stack([torch.as_tensor(x) for x in xs])  # [B,T,H,W,2]
+    xs = torch.stack([torch.as_tensor(x) for x in xs])
     ys = torch.tensor(ys, dtype=torch.long)
 
-    if xs.ndim != 5 or xs.shape[-1] != 2:
-        raise RuntimeError(f"Unexpected cached frame shape: {xs.shape} (expected [B,T,H,W,2])")
+    if xs.ndim != 5:
+        raise RuntimeError(f"Unexpected cached frame shape: {xs.shape}")
 
-    xs = xs.permute(0, 1, 4, 2, 3)  # [B,T,2,H,W]
+    # DVSGesture cache: [B,T,H,W,2] -> [B,T,2,H,W]
+    if xs.shape[-1] == 2:
+        xs = xs.permute(0, 1, 4, 2, 3)
+
+    # SHD cache: [B,T,1,1,700] already means [B,T,C,H,W]
+    elif xs.shape[2] == 1:
+        pass
+
+    else:
+        raise RuntimeError(
+            f"Unexpected cached frame shape: {xs.shape} "
+            f"(expected DVSGesture [B,T,H,W,2] or SHD [B,T,1,1,700])"
+        )
+
     xs = xs.float()
-    # normalize per-sample to keep values in a stable range
-    mx = xs.amax(dim=(1,2,3,4), keepdim=True).clamp(min=1.0)
+
+    # normalize per sample
+    mx = xs.amax(dim=(1, 2, 3, 4), keepdim=True).clamp(min=1.0)
     xs = xs / mx
+
     return xs, ys
 
 
 class ConvTemporalSNN(nn.Module):
-    def __init__(self, num_classes=11, beta=0.95):
+    def __init__(self, num_classes=20, beta=0.95):
         super().__init__()
         sg = surrogate.fast_sigmoid(slope=25)
 
-        self.conv1 = nn.Conv2d(2, 12, 5, padding=2)
+        self.conv1 = nn.Conv2d(1, 12, kernel_size=(1, 5), padding=(0, 2))
         self.lif1 = snn.Leaky(beta=beta, spike_grad=sg)
 
-        self.conv2 = nn.Conv2d(12, 32, 5, padding=2)
+        self.conv2 = nn.Conv2d(12, 32, kernel_size=(1, 5), padding=(0, 2))
         self.lif2 = snn.Leaky(beta=beta, spike_grad=sg)
 
-        self.pool = nn.AvgPool2d(2)
-        self.gap = nn.AdaptiveAvgPool2d((7, 7))
+        self.pool = nn.AvgPool2d((1, 2))
+        self.gap = nn.AdaptiveAvgPool2d((1, 32))
 
-        self.fc = nn.Linear(32 * 7 * 7, num_classes)
+        self.fc = nn.Linear(32 * 1 * 32, num_classes)
         self.lif_out = snn.Leaky(beta=beta, spike_grad=sg)
 
     def forward(self, spike_in):
@@ -133,7 +148,7 @@ def main(args):
     test_dl = DataLoader(test_ds, batch_size=args.batch, shuffle=False,
                          num_workers=args.workers, pin_memory=False, collate_fn=collate_cached)
 
-    net = ConvTemporalSNN(num_classes=11, beta=args.beta).to(device)
+    net = ConvTemporalSNN(num_classes=20, beta=args.beta).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
 
     # temporal loss (only used in temporal mode)
@@ -214,7 +229,7 @@ def main(args):
         mean_spikes = spike_sum / total
 
         print(f"[test] acc={acc_test:.4f}  mean_ttd={mean_ttd:.2f}  mean_spikes={mean_spikes:.1f}")
-        print(f"SUMMARY mode={args.mode} dataset=DVSGestureCached Ton={args.Ton} steps={args.steps} H={args.H} W={args.W} lam={args.lam}  "
+        print(f"SUMMARY mode={args.mode} dataset=SHDCached Ton={args.Ton} steps={args.steps} H={args.H} W={args.W} lam={args.lam}  "
               f"acc={acc_test:.4f}  ttd={mean_ttd:.2f}  spikes={mean_spikes:.1f}")
 
 
