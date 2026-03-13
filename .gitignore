@@ -24,4 +24,6 @@ env/
 runs/
 logs/
 checkpoints/
-wandb/
+wandb/snn_project.zip
+*.zip
+data/

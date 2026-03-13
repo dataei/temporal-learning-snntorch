@@ -66,7 +66,7 @@ def collate_cached(batch):
 
 
 class ConvTemporalSNN(nn.Module):
-    def __init__(self, num_classes=20, beta=0.95):
+    def __init__(self, num_classes=35, beta=0.95):
         super().__init__()
         sg = surrogate.fast_sigmoid(slope=25)
 
@@ -148,7 +148,7 @@ def main(args):
     test_dl = DataLoader(test_ds, batch_size=args.batch, shuffle=False,
                          num_workers=args.workers, pin_memory=False, collate_fn=collate_cached)
 
-    net = ConvTemporalSNN(num_classes=20, beta=args.beta).to(device)
+    net = ConvTemporalSNN(num_classes=35, beta=args.beta).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
 
     # temporal loss (only used in temporal mode)
